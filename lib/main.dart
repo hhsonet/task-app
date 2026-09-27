@@ -5,6 +5,7 @@ import 'package:intl/intl.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:share_plus/share_plus.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -76,8 +77,62 @@ class Task {
   );
 }
 
+class Meeting {
+  Meeting({
+    required this.id,
+    required this.title,
+    required this.date,
+    this.description = '',
+    this.startTime,
+    this.endTime,
+    this.location = '',
+    this.link = '',
+    this.notes = '',
+  });
+  final String id;
+  String title, description, location, link, notes;
+  DateTime date;
+  TimeOfDay? startTime, endTime;
+
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'title': title,
+    'description': description,
+    'date': date.toIso8601String(),
+    'startHour': startTime?.hour,
+    'startMinute': startTime?.minute,
+    'endHour': endTime?.hour,
+    'endMinute': endTime?.minute,
+    'location': location,
+    'link': link,
+    'notes': notes,
+  };
+  factory Meeting.fromJson(Map<String, dynamic> json) => Meeting(
+    id: json['id'] as String,
+    title: json['title'] as String? ?? '',
+    description: json['description'] as String? ?? '',
+    date: DateTime.tryParse(json['date'] as String? ?? '') ?? DateTime.now(),
+    startTime: json['startHour'] == null
+        ? null
+        : TimeOfDay(
+            hour: json['startHour'] as int,
+            minute: json['startMinute'] as int? ?? 0,
+          ),
+    endTime: json['endHour'] == null
+        ? null
+        : TimeOfDay(
+            hour: json['endHour'] as int,
+            minute: json['endMinute'] as int? ?? 0,
+          ),
+    location: json['location'] as String? ?? '',
+    link: json['link'] as String? ?? '',
+    notes: json['notes'] as String? ?? '',
+  );
+}
+
 class TaskStore extends ChangeNotifier {
   final tasks = <Task>[];
+  final meetings = <Meeting>[];
   SharedPreferences? _prefs;
   bool darkMode = false, remindersEnabled = true;
 
@@ -86,10 +141,17 @@ class TaskStore extends ChangeNotifier {
     darkMode = _prefs?.getBool('darkMode') ?? false;
     remindersEnabled = _prefs?.getBool('reminders') ?? true;
     final raw = _prefs?.getString('tasks');
+    final meetingRaw = _prefs?.getString('meetings');
     if (raw != null)
       tasks.addAll(
         (jsonDecode(raw) as List).map(
           (e) => Task.fromJson(e as Map<String, dynamic>),
+        ),
+      );
+    if (meetingRaw != null)
+      meetings.addAll(
+        (jsonDecode(meetingRaw) as List).map(
+          (e) => Meeting.fromJson(e as Map<String, dynamic>),
         ),
       );
     notifyListeners();
@@ -98,6 +160,10 @@ class TaskStore extends ChangeNotifier {
   Future<void> _save() async => _prefs?.setString(
     'tasks',
     jsonEncode(tasks.map((t) => t.toJson()).toList()),
+  );
+  Future<void> _saveMeetings() async => _prefs?.setString(
+    'meetings',
+    jsonEncode(meetings.map((m) => m.toJson()).toList()),
   );
   void upsert(Task task) {
     final i = tasks.indexWhere((t) => t.id == task.id);
@@ -132,6 +198,22 @@ class TaskStore extends ChangeNotifier {
   void setReminders(bool value) {
     remindersEnabled = value;
     _prefs?.setBool('reminders', value);
+    notifyListeners();
+  }
+
+  void upsertMeeting(Meeting meeting) {
+    final i = meetings.indexWhere((m) => m.id == meeting.id);
+    if (i == -1)
+      meetings.add(meeting);
+    else
+      meetings[i] = meeting;
+    _saveMeetings();
+    notifyListeners();
+  }
+
+  void deleteMeeting(Meeting meeting) {
+    meetings.removeWhere((m) => m.id == meeting.id);
+    _saveMeetings();
     notifyListeners();
   }
 }
@@ -189,17 +271,23 @@ class _HomeScreenState extends State<HomeScreen> {
       body: selectedIndex == 1
           ? const AllTasksScreen()
           : selectedIndex == 2
+          ? const CalendarScreen()
+          : selectedIndex == 3
           ? const SettingsScreen()
           : const DashboardScreen(),
-      floatingActionButton: selectedIndex == 2
+      floatingActionButton: selectedIndex == 3
           ? null
           : FloatingActionButton.extended(
               onPressed: () => Navigator.push(
                 context,
-                MaterialPageRoute(builder: (_) => const TaskEditor()),
+                MaterialPageRoute(
+                  builder: (_) => selectedIndex == 2
+                      ? const MeetingEditor()
+                      : const TaskEditor(),
+                ),
               ),
               icon: const Icon(Icons.add),
-              label: const Text('New task'),
+              label: Text(selectedIndex == 2 ? 'New meeting' : 'New task'),
             ),
       bottomNavigationBar: NavigationBar(
         selectedIndex: selectedIndex,
@@ -212,6 +300,10 @@ class _HomeScreenState extends State<HomeScreen> {
           NavigationDestination(
             icon: Icon(Icons.checklist_rounded),
             label: 'Tasks',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.calendar_month_rounded),
+            label: 'Calendar',
           ),
           NavigationDestination(
             icon: Icon(Icons.settings_outlined),
@@ -622,6 +714,274 @@ class _TaskEditorState extends State<TaskEditor> {
   }
 }
 
+class CalendarScreen extends StatefulWidget {
+  const CalendarScreen({super.key});
+  @override
+  State<CalendarScreen> createState() => _CalendarScreenState();
+}
+
+class _CalendarScreenState extends State<CalendarScreen> {
+  DateTime selectedDate = DateTime.now();
+  @override
+  Widget build(BuildContext context) {
+    final store = context.watch<TaskStore>();
+    final tasks = store.tasks
+        .where(
+          (task) =>
+              task.dueDate != null &&
+              DateUtils.isSameDay(task.dueDate, selectedDate),
+        )
+        .toList();
+    final meetings = store.meetings
+        .where((meeting) => DateUtils.isSameDay(meeting.date, selectedDate))
+        .toList();
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(12, 10, 12, 100),
+      children: [
+        const Padding(
+          padding: EdgeInsets.symmetric(horizontal: 8),
+          child: Text(
+            'Calendar',
+            style: TextStyle(fontSize: 28, fontWeight: FontWeight.w800),
+          ),
+        ),
+        Card(
+          child: CalendarDatePicker(
+            firstDate: DateTime(2020),
+            lastDate: DateTime(2100),
+            initialDate: selectedDate,
+            onDateChanged: (date) => setState(() => selectedDate = date),
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(8, 14, 8, 10),
+          child: Text(
+            DateFormat('EEEE, d MMMM').format(selectedDate),
+            style: const TextStyle(fontSize: 19, fontWeight: FontWeight.w800),
+          ),
+        ),
+        if (meetings.isEmpty && tasks.isEmpty)
+          const Card(
+            child: Padding(
+              padding: EdgeInsets.all(24),
+              child: Text(
+                'No tasks or meetings for this date.',
+                textAlign: TextAlign.center,
+              ),
+            ),
+          )
+        else
+          ...meetings.map((meeting) => MeetingTile(meeting: meeting)),
+        ...tasks.map((task) => TaskTile(task: task)),
+      ],
+    );
+  }
+}
+
+class MeetingTile extends StatelessWidget {
+  const MeetingTile({super.key, required this.meeting});
+  final Meeting meeting;
+  @override
+  Widget build(BuildContext context) => Card(
+    margin: const EdgeInsets.only(bottom: 10),
+    child: ListTile(
+      onTap: () => Navigator.push(
+        context,
+        MaterialPageRoute(builder: (_) => MeetingEditor(meeting: meeting)),
+      ),
+      leading: CircleAvatar(
+        backgroundColor: Theme.of(context).colorScheme.primaryContainer,
+        child: Icon(
+          Icons.video_call_rounded,
+          color: Theme.of(context).colorScheme.primary,
+        ),
+      ),
+      title: Text(
+        meeting.title,
+        style: const TextStyle(fontWeight: FontWeight.w700),
+      ),
+      subtitle: Text(
+        '${meeting.startTime?.format(context) ?? 'All day'}${meeting.location.isEmpty ? '' : ' · ${meeting.location}'}',
+      ),
+      trailing: meeting.link.isEmpty
+          ? const Icon(Icons.chevron_right)
+          : IconButton(
+              icon: const Icon(Icons.link),
+              tooltip: 'Meeting link',
+              onPressed: () async {
+                final uri = Uri.tryParse(meeting.link);
+                if (uri != null && await canLaunchUrl(uri)) {
+                  await launchUrl(uri, mode: LaunchMode.externalApplication);
+                } else if (context.mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text('Unable to open this meeting link'),
+                    ),
+                  );
+                }
+              },
+            ),
+    ),
+  );
+}
+
+class MeetingEditor extends StatefulWidget {
+  const MeetingEditor({super.key, this.meeting});
+  final Meeting? meeting;
+  @override
+  State<MeetingEditor> createState() => _MeetingEditorState();
+}
+
+class _MeetingEditorState extends State<MeetingEditor> {
+  late final TextEditingController title, description, location, link, notes;
+  late DateTime date;
+  TimeOfDay? startTime, endTime;
+  @override
+  void initState() {
+    super.initState();
+    final m = widget.meeting;
+    title = TextEditingController(text: m?.title);
+    description = TextEditingController(text: m?.description);
+    location = TextEditingController(text: m?.location);
+    link = TextEditingController(text: m?.link);
+    notes = TextEditingController(text: m?.notes);
+    date = m?.date ?? DateTime.now();
+    startTime = m?.startTime;
+    endTime = m?.endTime;
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+    appBar: AppBar(
+      title: Text(widget.meeting == null ? 'New meeting' : 'Edit meeting'),
+      actions: [
+        if (widget.meeting != null)
+          IconButton(
+            icon: const Icon(Icons.delete_outline),
+            onPressed: () {
+              context.read<TaskStore>().deleteMeeting(widget.meeting!);
+              Navigator.pop(context);
+            },
+          ),
+      ],
+    ),
+    body: ListView(
+      padding: const EdgeInsets.all(20),
+      children: [
+        _field(title, 'Meeting title', 'Team stand-up'),
+        const SizedBox(height: 14),
+        _field(description, 'Description', 'Agenda or context', lines: 3),
+        const SizedBox(height: 14),
+        OutlinedButton.icon(
+          onPressed: _pickDate,
+          icon: const Icon(Icons.calendar_today_outlined),
+          label: Text(DateFormat('EEEE, d MMM yyyy').format(date)),
+        ),
+        const SizedBox(height: 10),
+        Row(
+          children: [
+            Expanded(
+              child: OutlinedButton.icon(
+                onPressed: _pickStart,
+                icon: const Icon(Icons.schedule),
+                label: Text(startTime?.format(context) ?? 'Start time'),
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: OutlinedButton.icon(
+                onPressed: _pickEnd,
+                icon: const Icon(Icons.schedule_outlined),
+                label: Text(endTime?.format(context) ?? 'End time'),
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 14),
+        _field(location, 'Location', 'Optional location'),
+        const SizedBox(height: 14),
+        _field(link, 'Meeting link', 'https://meet.google.com/...'),
+        const SizedBox(height: 14),
+        _field(notes, 'Notes', 'Optional notes', lines: 3),
+        const SizedBox(height: 24),
+        FilledButton.icon(
+          onPressed: _save,
+          icon: const Icon(Icons.check),
+          label: const Padding(
+            padding: EdgeInsets.all(14),
+            child: Text('Save meeting'),
+          ),
+        ),
+      ],
+    ),
+  );
+  Widget _field(
+    TextEditingController c,
+    String label,
+    String hint, {
+    int lines = 1,
+  }) => TextField(
+    controller: c,
+    autofocus: label == 'Meeting title' && widget.meeting == null,
+    maxLines: lines,
+    decoration: InputDecoration(
+      labelText: label,
+      hintText: hint,
+      border: const OutlineInputBorder(),
+    ),
+  );
+  Future<void> _pickDate() async {
+    final value = await showDatePicker(
+      context: context,
+      firstDate: DateTime(2020),
+      lastDate: DateTime(2100),
+      initialDate: date,
+    );
+    if (value != null) setState(() => date = value);
+  }
+
+  Future<void> _pickStart() async {
+    final value = await showTimePicker(
+      context: context,
+      initialTime: startTime ?? TimeOfDay.now(),
+    );
+    if (value != null) setState(() => startTime = value);
+  }
+
+  Future<void> _pickEnd() async {
+    final value = await showTimePicker(
+      context: context,
+      initialTime: endTime ?? startTime ?? TimeOfDay.now(),
+    );
+    if (value != null) setState(() => endTime = value);
+  }
+
+  void _save() {
+    if (title.text.trim().isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Please add a meeting title')),
+      );
+      return;
+    }
+    context.read<TaskStore>().upsertMeeting(
+      Meeting(
+        id:
+            widget.meeting?.id ??
+            DateTime.now().microsecondsSinceEpoch.toString(),
+        title: title.text.trim(),
+        description: description.text.trim(),
+        date: date,
+        startTime: startTime,
+        endTime: endTime,
+        location: location.text.trim(),
+        link: link.text.trim(),
+        notes: notes.text.trim(),
+      ),
+    );
+    Navigator.pop(context);
+  }
+}
+
 class SettingsScreen extends StatelessWidget {
   const SettingsScreen({super.key});
   @override
@@ -660,7 +1020,10 @@ class SettingsScreen extends StatelessWidget {
             title: const Text('Export tasks'),
             onTap: () => SharePlus.instance.share(
               ShareParams(
-                text: jsonEncode(store.tasks.map((t) => t.toJson()).toList()),
+                text: jsonEncode({
+                  'tasks': store.tasks.map((t) => t.toJson()).toList(),
+                  'meetings': store.meetings.map((m) => m.toJson()).toList(),
+                }),
                 subject: 'LocalTask backup',
               ),
             ),
