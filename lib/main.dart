@@ -1,6 +1,7 @@
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
+import 'package:image_picker/image_picker.dart';
 import 'package:intl/intl.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -133,13 +134,30 @@ class Meeting {
 class TaskStore extends ChangeNotifier {
   final tasks = <Task>[];
   final meetings = <Meeting>[];
+  final categories = <String>[
+    'Personal',
+    'Work',
+    'Shopping',
+    'Errands',
+    'Custom',
+  ];
   SharedPreferences? _prefs;
   bool darkMode = false, remindersEnabled = true;
+  String profileName = '';
+  String? profilePhotoBase64;
 
   Future<void> load() async {
     _prefs = await SharedPreferences.getInstance();
     darkMode = _prefs?.getBool('darkMode') ?? false;
     remindersEnabled = _prefs?.getBool('reminders') ?? true;
+    profileName = _prefs?.getString('profileName') ?? '';
+    profilePhotoBase64 = _prefs?.getString('profilePhotoBase64');
+    final savedCategories = _prefs?.getStringList('categories');
+    if (savedCategories != null && savedCategories.isNotEmpty) {
+      categories
+        ..clear()
+        ..addAll(savedCategories);
+    }
     final raw = _prefs?.getString('tasks');
     final meetingRaw = _prefs?.getString('meetings');
     if (raw != null)
@@ -165,6 +183,8 @@ class TaskStore extends ChangeNotifier {
     'meetings',
     jsonEncode(meetings.map((m) => m.toJson()).toList()),
   );
+  Future<void> _saveCategories() async =>
+      _prefs?.setStringList('categories', categories);
   void upsert(Task task) {
     final i = tasks.indexWhere((t) => t.id == task.id);
     if (i == -1)
@@ -201,6 +221,22 @@ class TaskStore extends ChangeNotifier {
     notifyListeners();
   }
 
+  void setProfileName(String value) {
+    profileName = value.trim();
+    _prefs?.setString('profileName', profileName);
+    notifyListeners();
+  }
+
+  void setProfilePhoto(String? value) {
+    profilePhotoBase64 = value;
+    if (value == null) {
+      _prefs?.remove('profilePhotoBase64');
+    } else {
+      _prefs?.setString('profilePhotoBase64', value);
+    }
+    notifyListeners();
+  }
+
   void upsertMeeting(Meeting meeting) {
     final i = meetings.indexWhere((m) => m.id == meeting.id);
     if (i == -1)
@@ -214,6 +250,24 @@ class TaskStore extends ChangeNotifier {
   void deleteMeeting(Meeting meeting) {
     meetings.removeWhere((m) => m.id == meeting.id);
     _saveMeetings();
+    notifyListeners();
+  }
+
+  void addCategory(String name) {
+    final value = name.trim();
+    if (value.isEmpty ||
+        categories.any((item) => item.toLowerCase() == value.toLowerCase()))
+      return;
+    categories.add(value);
+    _saveCategories();
+    notifyListeners();
+  }
+
+  void deleteCategory(String name) {
+    if (['Personal', 'Work', 'Shopping', 'Errands', 'Custom'].contains(name))
+      return;
+    categories.remove(name);
+    _saveCategories();
     notifyListeners();
   }
 }
@@ -347,8 +401,10 @@ class DashboardScreen extends StatelessWidget {
           ),
         ),
         const SizedBox(height: 6),
-        const Text(
-          'Good morning',
+        Text(
+          store.profileName.isEmpty
+              ? 'Good morning'
+              : 'Good morning, ${store.profileName}',
           style: TextStyle(fontSize: 30, fontWeight: FontWeight.w800),
         ),
         const SizedBox(height: 22),
@@ -612,13 +668,11 @@ class _TaskEditorState extends State<TaskEditor> {
       labelText: 'Category',
       border: OutlineInputBorder(),
     ),
-    items: [
-      'Personal',
-      'Work',
-      'Shopping',
-      'Errands',
-      'Custom',
-    ].map((e) => DropdownMenuItem(value: e, child: Text(e))).toList(),
+    items: context
+        .read<TaskStore>()
+        .categories
+        .map((e) => DropdownMenuItem(value: e, child: Text(e)))
+        .toList(),
     onChanged: (v) => setState(() => category = v!),
   );
   Widget _priority() => DropdownButtonFormField<TaskPriority>(
@@ -996,6 +1050,24 @@ class SettingsScreen extends StatelessWidget {
         ),
         const SizedBox(height: 20),
         Card(
+          child: ListTile(
+            leading: ProfileAvatar(store: store),
+            title: Text(
+              store.profileName.isEmpty
+                  ? 'Set up your profile'
+                  : store.profileName,
+              style: const TextStyle(fontWeight: FontWeight.w700),
+            ),
+            subtitle: const Text('Add your name and profile photo'),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => const ProfileScreen()),
+            ),
+          ),
+        ),
+        const SizedBox(height: 14),
+        Card(
           child: Column(
             children: [
               SwitchListTile(
@@ -1011,6 +1083,21 @@ class SettingsScreen extends StatelessWidget {
                 onChanged: store.setReminders,
               ),
             ],
+          ),
+        ),
+        const SizedBox(height: 14),
+        Card(
+          child: ListTile(
+            leading: const Icon(Icons.label_outline),
+            title: const Text('Manage categories'),
+            subtitle: Text(
+              '${store.categories.length} categories available for tasks',
+            ),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () => showDialog(
+              context: context,
+              builder: (_) => const CategoryManagerDialog(),
+            ),
           ),
         ),
         const SizedBox(height: 14),
@@ -1038,6 +1125,250 @@ class SettingsScreen extends StatelessWidget {
         ),
       ],
     );
+  }
+}
+
+class ProfileAvatar extends StatelessWidget {
+  const ProfileAvatar({required this.store, super.key, this.radius = 24});
+  final TaskStore store;
+  final double radius;
+
+  @override
+  Widget build(BuildContext context) {
+    final photo = store.profilePhotoBase64;
+    if (photo != null && photo.isNotEmpty) {
+      try {
+        return CircleAvatar(
+          radius: radius,
+          backgroundImage: MemoryImage(base64Decode(photo)),
+        );
+      } on FormatException {
+        // Fall back to initials if an imported or older image is invalid.
+      }
+    }
+    final name = store.profileName.trim();
+    final initials = name.isEmpty
+        ? null
+        : name
+              .split(RegExp(r'\s+'))
+              .where((part) => part.isNotEmpty)
+              .take(2)
+              .map((part) => part[0].toUpperCase())
+              .join();
+    return CircleAvatar(
+      radius: radius,
+      child: initials == null
+          ? const Icon(Icons.person_outline)
+          : Text(initials, style: const TextStyle(fontWeight: FontWeight.w800)),
+    );
+  }
+}
+
+class ProfileScreen extends StatefulWidget {
+  const ProfileScreen({super.key});
+  @override
+  State<ProfileScreen> createState() => _ProfileScreenState();
+}
+
+class _ProfileScreenState extends State<ProfileScreen> {
+  late final TextEditingController nameController;
+  bool pickingPhoto = false;
+
+  @override
+  void initState() {
+    super.initState();
+    nameController = TextEditingController(
+      text: context.read<TaskStore>().profileName,
+    );
+  }
+
+  @override
+  void dispose() {
+    nameController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final store = context.watch<TaskStore>();
+    return Scaffold(
+      appBar: AppBar(title: const Text('Profile')),
+      body: ListView(
+        padding: const EdgeInsets.all(24),
+        children: [
+          Center(
+            child: Stack(
+              alignment: Alignment.bottomRight,
+              children: [
+                ProfileAvatar(store: store, radius: 58),
+                IconButton.filled(
+                  tooltip: 'Upload photo',
+                  onPressed: pickingPhoto ? null : _pickPhoto,
+                  icon: pickingPhoto
+                      ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.camera_alt_outlined),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 12),
+          Center(
+            child: TextButton.icon(
+              onPressed: pickingPhoto ? null : _pickPhoto,
+              icon: const Icon(Icons.photo_library_outlined),
+              label: const Text('Choose photo'),
+            ),
+          ),
+          const SizedBox(height: 24),
+          TextField(
+            controller: nameController,
+            textCapitalization: TextCapitalization.words,
+            maxLength: 50,
+            decoration: const InputDecoration(
+              labelText: 'Your name',
+              hintText: 'Enter your name',
+              prefixIcon: Icon(Icons.person_outline),
+              border: OutlineInputBorder(),
+            ),
+          ),
+          const SizedBox(height: 12),
+          FilledButton.icon(
+            onPressed: () {
+              store.setProfileName(nameController.text);
+              Navigator.pop(context);
+            },
+            icon: const Icon(Icons.save_outlined),
+            label: const Text('Save profile'),
+          ),
+          if (store.profilePhotoBase64 != null) ...[
+            const SizedBox(height: 8),
+            TextButton(
+              onPressed: () => store.setProfilePhoto(null),
+              child: const Text('Remove photo'),
+            ),
+          ],
+          const SizedBox(height: 20),
+          const Text(
+            'Your profile stays on this device and is not uploaded to an account or cloud service.',
+            textAlign: TextAlign.center,
+            style: TextStyle(color: Colors.grey),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _pickPhoto() async {
+    setState(() => pickingPhoto = true);
+    try {
+      final picked = await ImagePicker().pickImage(
+        source: ImageSource.gallery,
+        maxWidth: 800,
+        maxHeight: 800,
+        imageQuality: 80,
+      );
+      if (picked != null && mounted) {
+        final bytes = await picked.readAsBytes();
+        if (bytes.isNotEmpty) {
+          context.read<TaskStore>().setProfilePhoto(base64Encode(bytes));
+        }
+      }
+    } finally {
+      if (mounted) setState(() => pickingPhoto = false);
+    }
+  }
+}
+
+class CategoryManagerDialog extends StatefulWidget {
+  const CategoryManagerDialog({super.key});
+  @override
+  State<CategoryManagerDialog> createState() => _CategoryManagerDialogState();
+}
+
+class _CategoryManagerDialogState extends State<CategoryManagerDialog> {
+  final controller = TextEditingController();
+  @override
+  Widget build(BuildContext context) {
+    final store = context.watch<TaskStore>();
+    return AlertDialog(
+      title: const Text('Task categories'),
+      content: SizedBox(
+        width: 360,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: controller,
+                    textInputAction: TextInputAction.done,
+                    onSubmitted: (_) => _add(),
+                    decoration: const InputDecoration(
+                      labelText: 'New category',
+                      hintText: 'Fitness',
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                IconButton.filled(onPressed: _add, icon: const Icon(Icons.add)),
+              ],
+            ),
+            const SizedBox(height: 16),
+            Flexible(
+              child: ListView(
+                shrinkWrap: true,
+                children: store.categories
+                    .map(
+                      (category) => ListTile(
+                        dense: true,
+                        leading: const Icon(Icons.label),
+                        title: Text(category),
+                        trailing:
+                            [
+                              'Personal',
+                              'Work',
+                              'Shopping',
+                              'Errands',
+                              'Custom',
+                            ].contains(category)
+                            ? null
+                            : IconButton(
+                                icon: const Icon(Icons.delete_outline),
+                                onPressed: () => store.deleteCategory(category),
+                              ),
+                      ),
+                    )
+                    .toList(),
+              ),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Done'),
+        ),
+      ],
+    );
+  }
+
+  void _add() {
+    context.read<TaskStore>().addCategory(controller.text);
+    controller.clear();
+    setState(() {});
+  }
+
+  @override
+  void dispose() {
+    controller.dispose();
+    super.dispose();
   }
 }
 
